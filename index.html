@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>大数据检索工具</title>
+    <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+    <script src="fast-find.js"></script>
+    <style>
+        :root { color-scheme: light dark; }
+        * { box-sizing: border-box; }
+        body { 
+            font-family: system-ui, -apple-system, sans-serif; 
+            margin: 0; 
+            background: #0b0c10; 
+            color: #e6edf3; 
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        header { 
+            padding: 12px 16px; 
+            background: #161b22; 
+            border-bottom: 1px solid #30363d; 
+            flex-shrink: 0;
+        }
+        h1 { margin: 0; font-size: 18px; }
+        
+        .toolbar {
+            padding: 12px 16px;
+            background: #0d1117;
+            border-bottom: 1px solid #30363d;
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+            align-items: end;
+            flex-shrink: 0;
+        }
+        
+        .input-group {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        
+        label { font-size: 12px; color: #8b949e; }
+        
+        input {
+            background: #0b0c10;
+            border: 1px solid #30363d;
+            color: #e6edf3;
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-family: monospace;
+            min-width: 120px;
+        }
+        
+        button {
+            background: #1f6feb;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 500;
+        }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        button.secondary { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; }
+        
+        .status-bar {
+            padding: 4px 16px;
+            font-size: 12px;
+            color: #8b949e;
+            background: #161b22;
+            border-bottom: 1px solid #30363d;
+            flex-shrink: 0;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        /* 虚拟列表容器 */
+        #list-container {
+            flex: 1;
+            overflow-y: auto;
+            position: relative;
+            background: #0b0c10;
+            contain: strict;
+        }
+        
+        /* 撑开高度的幽灵元素 */
+        #phantom {
+            position: absolute;
+            left: 0;
+            top: 0;
+            right: 0;
+            z-index: -1;
+        }
+        
+        /* 实际渲染内容的容器 */
+        #list-content {
+            position: absolute;
+            left: 0;
+            right: 0;
+            top: 0;
+        }
+        
+        .list-item {
+            height: 30px; /* 固定高度，与JS中 ITEM_HEIGHT 一致 */
+            line-height: 30px;
+            padding: 0 16px;
+            border-bottom: 1px solid #21262d;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            font-family: monospace;
+            font-size: 13px;
+        }
+        .list-item:hover { background: #161b22; }
+        
+        .highlight { color: #7ee787; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>大数据检索工具 (Virtual List)</h1>
+    </header>
+    
+    <div class="toolbar">
+        <div class="input-group">
+            <label>数据源</label>
+            <button id="loadBtn">读取 abc.txt</button>
+        </div>
+        <div class="input-group">
+            <label>姓氏 (首字)</label>
+            <input id="surnameInput" placeholder="如：张" maxlength="1">
+        </div>
+        <div class="input-group">
+            <label>年份 (第7-10位)</label>
+            <input id="yearInput" placeholder="如：1990" maxlength="4">
+        </div>
+        <div class="input-group">
+            <label>省份 (前2位)</label>
+            <input id="provinceInput" placeholder="如：33" maxlength="2">
+        </div>
+        <div class="input-group">
+            <label>&nbsp;</label>
+            <button id="searchBtn" disabled>🔍 筛选</button>
+        </div>
+        <div class="input-group">
+            <label>&nbsp;</label>
+            <button id="resetBtn" class="secondary" disabled>重置</button>
+        </div>
+    </div>
+
+    <div class="status-bar">
+        <span id="status">就绪</span>
+        <span id="count">共 0 条数据</span>
+    </div>
+
+    <div id="list-container">
+        <div id="phantom"></div>
+        <div id="list-content"></div>
+    </div>
+
+    <script>
+        // 配置
+        const FILE_URL = 'def.txt';
+        const ITEM_HEIGHT = 30; // 列表项高度 px
+        const BUFFER_SIZE = 10; // 上下缓冲渲染数量
+
+        // 状态
+        let ALL_DATA = []; // 清洗后的完整数据
+        let DISPLAY_DATA = []; // 当前展示的数据（筛选后）
+        let isReading = false;
+        const fastFind = new FastFind();
+
+        // DOM 元素
+        const listContainer = document.getElementById('list-container');
+        const phantom = document.getElementById('phantom');
+        const listContent = document.getElementById('list-content');
+        const statusEl = document.getElementById('status');
+        const countEl = document.getElementById('count');
+        const loadBtn = document.getElementById('loadBtn');
+        const searchBtn = document.getElementById('searchBtn');
+        const resetBtn = document.getElementById('resetBtn');
+
+        // 输入框
+        const surnameInput = document.getElementById('surnameInput');
+        const yearInput = document.getElementById('yearInput');
+        const provinceInput = document.getElementById('provinceInput');
+
+        // --- 核心功能：数据读取与清洗 ---
+
+        async function loadData() {
+            if (isReading) return;
+            isReading = true;
+            loadBtn.disabled = true;
+            loadBtn.textContent = '读取中...';
+            statusEl.textContent = '正在读取并清洗数据...';
+            
+            ALL_DATA = [];
+            let pendingLine = null; // 用于暂存需要合并的纯文本行
+            let rawCount = 0;
+
+            Papa.parse(FILE_URL, {
+                download: true,
+                step: function(row, parser) {
+                    // 简单的流式处理
+                    let line = row.data;
+                    if (Array.isArray(line)) line = line.join(' ');
+                    line = line ? line.trim() : '';
+                    
+                    if (!line) return;
+                    rawCount++;
+
+                    // 简单的格式判断：是否包含数字
+                    const hasDigit = /\d/.test(line);
+
+                    if (hasDigit) {
+                        if (pendingLine) {
+                            // 如果有挂起的文本行，合并
+                            ALL_DATA.push(pendingLine + ' ' + line);
+                            pendingLine = null;
+                        } else {
+                            // 正常行（假设包含文本和数字，或者只是数字但没前文）
+                            // 需求：保证每一行都是“汉字或字母+空格+数字”
+                            // 如果当前行既有汉字又有数字，直接添加
+                            // 如果当前行只有数字，且没有pendingLine，可能是不完整数据，但暂且保留
+                            ALL_DATA.push(line);
+                        }
+                    } else {
+                        // 只有汉字或字母
+                        if (pendingLine) {
+                            // 连续两行纯文本？丢弃上一行或合并？
+                            // 简单起见，丢弃上一行，保留最新
+                            pendingLine = line;
+                        } else {
+                            pendingLine = line;
+                        }
+                    }
+
+                    if (rawCount % 50000 === 0) {
+                        statusEl.textContent = `已读取 ${rawCount.toLocaleString()} 行...`;
+                    }
+                },
+                complete: function() {
+                    isReading = false;
+                    loadBtn.textContent = '读取完成';
+                    statusEl.textContent = '数据处理完毕';
+                    
+                    // 初始化展示
+                    DISPLAY_DATA = ALL_DATA;
+                    
+                    // 构建索引
+                    statusEl.textContent = '正在构建索引...';
+                    // 给 UI 一点时间渲染状态
+                    setTimeout(() => {
+                        fastFind.setData(ALL_DATA);
+                        statusEl.textContent = '数据处理完毕';
+                        updateCount();
+                        initVirtualList();
+                        
+                        searchBtn.disabled = false;
+                        resetBtn.disabled = false;
+                    }, 50);
+                },
+                error: function(err) {
+                    console.error(err);
+                    statusEl.textContent = '读取失败: ' + err.message;
+                    loadBtn.disabled = false;
+                    loadBtn.textContent = '重试读取';
+                    isReading = false;
+                    alert(`无法读取 ${FILE_URL}。请确保使用本地服务器运行。`);
+                }
+            });
+        }
+
+        // --- 核心功能：筛选 ---
+
+        function performSearch() {
+            if (!ALL_DATA.length) return;
+
+            const surname = surnameInput.value.trim();
+            const year = yearInput.value.trim();
+            const province = provinceInput.value.trim();
+
+            statusEl.textContent = '正在筛选...';
+            
+            // 使用 requestAnimationFrame 避免阻塞 UI
+            requestAnimationFrame(() => {
+                const startTime = performance.now();
+                
+                // 使用 FastFind 进行高性能检索
+                DISPLAY_DATA = fastFind.search({ surname, year, province });
+                
+                const endTime = performance.now();
+                console.log(`Search took ${endTime - startTime}ms`);
+
+                statusEl.textContent = `筛选完成 (耗时 ${(endTime - startTime).toFixed(2)}ms)`;
+                updateCount();
+                
+                // 重置滚动条并重新渲染
+                listContainer.scrollTop = 0;
+                initVirtualList();
+            });
+        }
+
+        function resetSearch() {
+            surnameInput.value = '';
+            yearInput.value = '';
+            provinceInput.value = '';
+            DISPLAY_DATA = ALL_DATA;
+            updateCount();
+            listContainer.scrollTop = 0;
+            initVirtualList();
+        }
+
+        function updateCount() {
+            countEl.textContent = `显示 ${DISPLAY_DATA.length.toLocaleString()} 条 / 共 ${ALL_DATA.length.toLocaleString()} 条`;
+        }
+
+        // --- 核心功能：虚拟列表渲染 ---
+
+        function initVirtualList() {
+            // 设置幽灵元素高度
+            const totalHeight = DISPLAY_DATA.length * ITEM_HEIGHT;
+            phantom.style.height = `${totalHeight}px`;
+            renderVirtualList();
+        }
+
+        function renderVirtualList() {
+            const scrollTop = listContainer.scrollTop;
+            const containerHeight = listContainer.clientHeight;
+
+            // 计算可视区域的起始和结束索引
+            const startIndex = Math.floor(scrollTop / ITEM_HEIGHT);
+            const endIndex = Math.min(
+                DISPLAY_DATA.length, 
+                Math.ceil((scrollTop + containerHeight) / ITEM_HEIGHT)
+            );
+
+            // 加上缓冲区域
+            const renderStart = Math.max(0, startIndex - BUFFER_SIZE);
+            const renderEnd = Math.min(DISPLAY_DATA.length, endIndex + BUFFER_SIZE);
+
+            // 生成HTML
+            let html = '';
+            for (let i = renderStart; i < renderEnd; i++) {
+                const item = DISPLAY_DATA[i];
+                // 简单高亮处理（可选，会影响性能，这里暂不做复杂高亮）
+                html += `<div class="list-item">${item}</div>`;
+            }
+
+            listContent.innerHTML = html;
+            
+            // 偏移 content 位置
+            listContent.style.transform = `translateY(${renderStart * ITEM_HEIGHT}px)`;
+        }
+
+        // --- 事件监听 ---
+
+        loadBtn.addEventListener('click', loadData);
+        searchBtn.addEventListener('click', performSearch);
+        resetBtn.addEventListener('click', resetSearch);
+
+        // 滚动事件监听（节流优化可选，但现代浏览器处理 scroll 很快）
+        listContainer.addEventListener('scroll', () => {
+            requestAnimationFrame(renderVirtualList);
+        });
+
+        // 回车搜索
+        [surnameInput, yearInput, provinceInput].forEach(input => {
+            input.addEventListener('keyup', (e) => {
+                if (e.key === 'Enter') performSearch();
+            });
+        });
+
+    </script>
+</body>
+</html>
